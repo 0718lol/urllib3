@@ -611,12 +611,15 @@ class TestResponse:
         # 'gzip, br' must fail loudly with a clear DecodeError instead of
         # silently routing the 'br' step to DeflateDecoder. Runs in a fresh
         # interpreter because urllib3 reads the env var only at import time
-        # (the standalone 'brotli' package is still importable to build the
-        # test body even when urllib3's brotli support is opted out).
+        # (the standalone Brotli backend is still importable to build the
+        # test body even when urllib3's Brotli support is opted out).
         script = textwrap.dedent("""
             import gzip
             from io import BytesIO
-            import brotli
+            try:
+                import brotlicffi as brotli
+            except ImportError:
+                import brotli
             from urllib3.exceptions import DecodeError
             from urllib3.response import HTTPResponse
 
@@ -682,7 +685,9 @@ class TestResponse:
             headers={"content-encoding": "gzip, br"},
             preload_content=False,
         )
-        with pytest.raises(DecodeError, match="Brotli content-encoding is not available"):
+        with pytest.raises(
+            DecodeError, match="Brotli content-encoding is not available"
+        ):
             response.read()
 
     @onlyZstd()
