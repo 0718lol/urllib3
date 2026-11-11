@@ -13,6 +13,7 @@ import typing
 import zlib
 from base64 import b64decode
 from http.client import IncompleteRead as httplib_IncompleteRead
+from importlib.util import find_spec
 from io import BufferedReader, BytesIO, TextIOWrapper
 from test import LONG_TIMEOUT, onlyBrotli, onlyZstd
 from unittest import mock
@@ -578,33 +579,31 @@ class TestResponse:
                 assert _imported_brotli is None
             print("OK")
             """)
-        for env, expected in [(env_on, "OK"), (env_off, "OK")]:
-            # Run under coverage so the import-time branches above (including
-            # the env-gated raise ImportError lines) are recorded; a fresh
-            # interpreter is still required because urllib3 reads the env var
-            # only at import time.
-            cov_file = os.environ.get("COVERAGE_FILE", ".coverage")
-            cov_file += (
-                ".brotli_on" if "URLLIB3_DISABLE_BROTLI" in env else ".brotli_off"
-            )
-            run_env = {**env, "COVERAGE_FILE": cov_file}
-            wrapper = (
-                "import coverage; "
-                "c = coverage.Coverage(source=['urllib3']); "
-                "c.start(); "
-                "exec(%r); "
-                "c.stop(); "
-                "c.save()"
-            ) % script
+        collect_coverage = find_spec("coverage") is not None
+        for env, mode in [(env_on, "disabled"), (env_off, "enabled")]:
+            child_script = script
+            if collect_coverage:
+                # Include import-time branches when running with coverage.
+                cov_file = env.get("COVERAGE_FILE", ".coverage")
+                env = {**env, "COVERAGE_FILE": f"{cov_file}.brotli_{mode}"}
+                child_script = (
+                    "import coverage; "
+                    "c = coverage.Coverage(source=['urllib3']); "
+                    "c.start(); "
+                    f"exec({script!r}); "
+                    "c.stop(); "
+                    "c.save()"
+                )
+
             ret = subprocess.run(
-                [sys.executable, "-c", wrapper],
-                env=run_env,
+                [sys.executable, "-c", child_script],
+                env=env,
                 capture_output=True,
                 text=True,
                 timeout=60,
             )
-            assert ret.returncode == 0, f"env={env!r}\n{ret.stdout}\n{ret.stderr}"
-            assert ret.stdout.strip() == expected
+            assert ret.returncode == 0, f"Brotli {mode}\n{ret.stdout}\n{ret.stderr}"
+            assert ret.stdout.strip() == "OK"
 
     @onlyBrotli()
     def test_decode_compound_gzip_br_with_brotli_disabled(self) -> None:
@@ -649,6 +648,42 @@ class TestResponse:
         )
         assert ret.returncode == 0, f"{ret.stdout}\n{ret.stderr}"
         assert ret.stdout.strip() == "OK"
+
+    @pytest.mark.parametrize("read_method", ["read", "read1", "stream", "chunked"])
+    def test_raw_compound_read_without_brotli(
+        self, monkeypatch: pytest.MonkeyPatch, read_method: str
+    ) -> None:
+        monkeypatch.setattr("urllib3.response.brotli", None)
+        data = b"opaque encoded body"
+        headers = {"content-encoding": "gzip, br"}
+        body: BytesIO | httplib.HTTPResponse = BytesIO(data)
+        if read_method == "chunked":
+            chunked = httplib.HTTPResponse(MockSock)  # type: ignore[arg-type]
+            chunked.chunked = True
+            chunked.chunk_left = None
+            chunked.fp = MockChunkedEncodingResponse([data])  # type: ignore[assignment]
+            headers["transfer-encoding"] = "chunked"
+            body = chunked
+
+        response = HTTPResponse(body, headers=headers, preload_content=False)
+        if read_method == "read":
+            assert response.read(decode_content=False) == data
+        elif read_method == "read1":
+            assert response.read1(decode_content=False) == data
+        else:
+            assert b"".join(response.stream(4, decode_content=False)) == data
+
+    def test_decode_compound_gzip_br_without_brotli(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("urllib3.response.brotli", None)
+        response = HTTPResponse(
+            BytesIO(b"opaque encoded body"),
+            headers={"content-encoding": "gzip, br"},
+            preload_content=False,
+        )
+        with pytest.raises(DecodeError, match="Brotli content-encoding is not available"):
+            response.read()
 
     @onlyZstd()
     def test_decode_zstd(self) -> None:
